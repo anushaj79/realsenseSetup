@@ -1,0 +1,268 @@
+--- a/src/ds/d400/d400-factory.cpp
++++ b/src/ds/d400/d400-factory.cpp
+@@ -865,7 +865,7 @@
+             , firmware_logger_device( dev_info, d400_device::_hw_monitor, get_firmware_logs_command(), get_flash_logs_command() )
+         {
+             ds_advanced_mode_base::initialize_advanced_mode( this );
+-#if !defined(__APPLE__) // Motion sensors not supported on macOS
++#if !defined(__APPLE__) || defined(RS2_MACOS_MOTION) // Motion sensors not supported on macOS (unless patched)
+             register_gyro_sensitivity();
+ #endif
+         }
+@@ -1076,7 +1076,7 @@
+             , ds_thermal_tracking( d400_device::_thermal_monitor )
+         {
+             ds_advanced_mode_base::initialize_advanced_mode( this );
+-#if !defined(__APPLE__) // Motion sensors not supported on macOS
++#if !defined(__APPLE__) || defined(RS2_MACOS_MOTION) // Motion sensors not supported on macOS (unless patched)
+             register_gyro_sensitivity();
+ #endif
+         }
+--- a/src/ds/d400/d400-motion.cpp
++++ b/src/ds/d400/d400-motion.cpp
+@@ -180,9 +180,22 @@
+ 
+             initialize_fisheye_sensor( dev_info->get_context(), dev_info->get_group() );
+ 
+-#if !defined(__APPLE__) // Motion sensors not supported on macOS
++#if !defined(__APPLE__) || defined(RS2_MACOS_MOTION) // Motion sensors not supported on macOS (unless patched)
+             // Try to add HID endpoint
++#if defined(__APPLE__)
++            std::shared_ptr< synthetic_sensor > hid_ep;
++            try
++            {
++                hid_ep = create_hid_device( dev_info->get_context(), dev_info->get_group().hid_devices );
++            }
++            catch( const std::exception & e )
++            {
++                LOG_WARNING( "macOS: IMU unavailable, continuing without it: " << e.what() );
++                _has_motion_module_failed = true;
++            }
++#else
+             auto hid_ep = create_hid_device( dev_info->get_context(), dev_info->get_group().hid_devices );
++#endif
+             if (hid_ep)
+             {
+                 _motion_module_device_idx = static_cast<uint8_t>(add_sensor(hid_ep));
+@@ -191,7 +204,7 @@
+                 hid_ep->get_raw_sensor()->register_metadata(RS2_FRAME_METADATA_FRAME_TIMESTAMP, make_hid_header_parser(&hid_header::timestamp));
+             }
+             //for FW >=5.16 the scale factor changes to 1000.0 since FW sends 32bit
+-            if (_fw_version >= firmware_version( 5, 16, 0, 0))
++            if (hid_ep && _fw_version >= firmware_version( 5, 16, 0, 0))
+                 get_raw_motion_sensor()->set_gyro_scale_factor( 10000.0 );
+             // Windows MF receives accel in G and rebuilds FW counts; derive the factor from the
+             // same scale the transform uses so the two can never disagree (1000 legacy, 100000 new)
+@@ -216,7 +229,7 @@
+ 
+     ds_motion_sensor & d400_motion::get_motion_sensor()
+     {
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(RS2_MACOS_MOTION)
+         throw std::runtime_error("Motion sensors are not supported on macOS");
+ #else
+         return dynamic_cast< ds_motion_sensor & >( get_sensor( _motion_module_device_idx.value() ) );
+@@ -225,7 +238,7 @@
+ 
+     std::shared_ptr<hid_sensor> d400_motion::get_raw_motion_sensor()
+     {
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(RS2_MACOS_MOTION)
+         return nullptr;
+ #else
+         auto raw_sensor = get_motion_sensor().get_raw_sensor();
+@@ -326,7 +339,8 @@
+ 
+     void d400_motion::register_gyro_sensitivity()
+     {
+-        if( _fw_version >= firmware_version( 5, 16, 0, 0 ) && !_has_motion_module_failed)
++        if( _fw_version >= firmware_version( 5, 16, 0, 0 ) && !_has_motion_module_failed
++            && _motion_module_device_idx )
+                 register_feature(
+                     std::make_shared< gyro_sensitivity_feature >( get_raw_motion_sensor(), get_motion_sensor() ) );
+     }
+--- a/src/hid/hid-device.h
++++ b/src/hid/hid-device.h
+@@ -17,7 +17,15 @@
+ #include <thread>
+ #include "../types.h"
+ 
+-#ifdef __APPLE__
++// macOS reads the IMU through hidapi/IOKit -- unless RS2_MACOS_MOTION, where
++// it takes the libusb path like Linux: on Darwin every libusb device holds a
++// whole-device capture (darwin-device-capture), which detaches IOHIDFamily, so
++// the IOKit HID device hidapi wants no longer exists once depth is open.
++#if defined(__APPLE__) && !defined(RS2_MACOS_MOTION)
++#define RS_HID_USE_HIDAPI 1
++#endif
++
++#ifdef RS_HID_USE_HIDAPI
+ #include <hidapi.h>
+ #endif
+ 
+@@ -53,7 +61,7 @@
+             rs_usb_interface get_hid_interface();
+             //for gyro sensitivity the default value we set in feature report is 0.1, which is mapped in FW to 30.5 millideg/sec
+             usb_status set_feature_report( unsigned char power, int report_id, int fps = 0, double sensitivity = 0.1 );
+-#ifdef __APPLE__
++#ifdef RS_HID_USE_HIDAPI
+            int hidapi_PowerDevice(unsigned char reportId);
+ #endif
+ 
+@@ -62,7 +70,7 @@
+ 
+             hid_callback _callback;
+             rs_usb_device _usb_device;
+-#ifdef __APPLE__
++#ifdef RS_HID_USE_HIDAPI
+             hidapi_device* _hidapi_device = nullptr;
+ #else
+             rs_usb_messenger _messenger;
+--- a/src/hid/hid-device.cpp
++++ b/src/hid/hid-device.cpp
+@@ -65,21 +65,24 @@
+             _sensor_to_id[gyro] = REPORT_ID_GYROMETER_3D;
+             _sensor_to_id[accel] = REPORT_ID_ACCELEROMETER_3D;
+             _sensor_to_id[custom] = REPORT_ID_CUSTOM;
+-#ifdef __APPLE__
++#ifdef RS_HID_USE_HIDAPI
+             hidapi_device_info *devices = hid_enumerate(0x8086, 0x0);
+             if(devices)
+             {
+                 _hidapi_device = hid_open(devices[0].vendor_id, devices[0].product_id, devices[0].serial_number);
+-                hidapi_PowerDevice(REPORT_ID_ACCELEROMETER_3D);
+-                hidapi_PowerDevice(REPORT_ID_GYROMETER_3D);
++                hid_free_enumeration(devices);
+             }
++            if( ! _hidapi_device )
++                throw std::runtime_error( "could not open the IMU HID device (hidapi)" );
++            hidapi_PowerDevice(REPORT_ID_ACCELEROMETER_3D);
++            hidapi_PowerDevice(REPORT_ID_GYROMETER_3D);
+ #endif
+             _action_dispatcher.start();
+         }
+ 
+         rs_hid_device::~rs_hid_device()
+         {
+-#ifdef __APPLE__
++#ifdef RS_HID_USE_HIDAPI
+             if( _hidapi_device )
+                 hid_close( _hidapi_device );
+ #endif
+@@ -117,7 +120,7 @@
+             {
+                 if(!_running)
+                     return;
+-#ifndef __APPLE__
++#ifndef RS_HID_USE_HIDAPI
+                 _request_callback->cancel();
+ 
+                 _queue.clear();
+@@ -128,7 +131,7 @@
+                 _requests.clear();
+ #endif
+                 _handle_interrupts_thread->stop();
+-#ifndef __APPLE__
++#ifndef RS_HID_USE_HIDAPI
+                 _messenger.reset();
+ #endif
+                _running = false;
+@@ -143,7 +146,7 @@
+                     return;
+ 
+                 _callback = callback;
+-#ifndef __APPLE__
++#ifndef RS_HID_USE_HIDAPI
+                 auto in = get_hid_interface()->get_number();
+                 _messenger = _usb_device->open(in);
+ #endif
+@@ -154,7 +157,7 @@
+ 
+                 _handle_interrupts_thread->start();
+ 
+-#ifndef __APPLE__
++#ifndef RS_HID_USE_HIDAPI
+                 _request_callback = std::make_shared<usb_request_callback>([&](platform::rs_usb_request r)
+                     {
+                         _action_dispatcher.invoke([this, r](dispatcher::cancellable_timer c)
+@@ -212,7 +215,7 @@
+                 }
+ #endif
+                 _running = true;
+-#ifndef __APPLE__
++#ifndef RS_HID_USE_HIDAPI
+                 for(auto&& r : _requests)
+                     _messenger->submit_request(r);
+ #endif
+@@ -229,7 +232,7 @@
+             // For FW >= 5.16 we can just use memcpy as the structs size match
+            
+ 
+-#ifdef __APPLE__
++#ifdef RS_HID_USE_HIDAPI
+             unsigned char tmp_buffer[100] = { 0 };
+             hid_read( _hidapi_device, tmp_buffer, _realsense_hid_report_actual_size );
+             if( _realsense_hid_report_actual_size != sizeof( REALSENSE_HID_REPORT ) )
+@@ -378,7 +381,7 @@
+             return res;
+         }
+ 
+-#ifdef __APPLE__
++#ifdef RS_HID_USE_HIDAPI
+         int rs_hid_device::hidapi_PowerDevice(unsigned char reportId)
+         {
+             if (_hidapi_device == NULL)
+--- a/third-party/hidapi/hidapi.cpp
++++ b/third-party/hidapi/hidapi.cpp
+@@ -434,11 +434,16 @@
+             
+             /* Fill in the path (IOService plane) */
+             iokit_dev = hidapi_IOHIDDeviceGetService(dev);
+-            res = IORegistryEntryGetPath(iokit_dev, kIOServicePlane, path);
+-            if (res == KERN_SUCCESS)
++            uint64_t entry_id = 0;
++            if (iokit_dev != MACH_PORT_NULL &&
++                IORegistryEntryGetRegistryEntryID(iokit_dev, &entry_id) == KERN_SUCCESS) {
++                snprintf(path, sizeof(path), "DevSrvsID:%llu", (unsigned long long) entry_id);
+                 cur_dev->path = strdup(path);
+-            else
+-                cur_dev->path = strdup("");
++            }
++            else {
++                res = IORegistryEntryGetPath(iokit_dev, kIOServicePlane, path);
++                cur_dev->path = strdup(res == KERN_SUCCESS ? path : "");
++            }
+             
+             /* Serial Number */
+             get_serial_number(dev, buf, BUF_LEN);
+@@ -671,17 +676,26 @@
+     bool return_error = false;
+ 
+     /* Get the IORegistry entry for the given path */
+-    entry = IORegistryEntryFromPath(kIOMasterPortDefault, path);
++    if (strncmp(path, "DevSrvsID:", 10) == 0) {
++        uint64_t entry_id = strtoull(path + 10, NULL, 10);
++        entry = IOServiceGetMatchingService(kIOMasterPortDefault, IORegistryEntryIDMatching(entry_id));
++    }
++    else {
++        entry = IORegistryEntryFromPath(kIOMasterPortDefault, path);
++    }
+     if (entry == MACH_PORT_NULL) {
+         /* Path wasn't valid (maybe device was removed?) */
+-        return_error = true;
++        free_hid_device(dev);
++        return NULL;
+     }
+ 
+     /* Create an IOHIDDevice for the entry */
+     dev->device_handle = IOHIDDeviceCreate(kCFAllocatorDefault, entry);
+     if (dev->device_handle == NULL) {
+-        /* Error creating the HID device */
+-        return_error = true;
++        /* Error creating the HID device -- never hand NULL to IOHIDDeviceOpen */
++        IOObjectRelease(entry);
++        free_hid_device(dev);
++        return NULL;
+     }
+ 
+     /* Open the IOHIDDevice */
